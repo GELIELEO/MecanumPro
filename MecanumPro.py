@@ -13,89 +13,119 @@ from MecanumBase import MecanumBase
 from ultrasonic import Ultrasonic
 from serial import Serial
 import threading
-import pygame
+from threading import Event
 import numpy as np
+import pygame
 from copy import deepcopy
 
+TVEL = 30
+RVEL = 3
+FRAMERATE = 20
+STP = 1/FRAMERATE
+SAFEDIS = 100
+
+class DrivingInfo:
+    destination = np.zeros(2)
+    distance = 0
+    vel = TVEL
+    mode = 'translate'
 
 class MecanumPro(threading.Thread):
-    def __init__(self,ultra_com,mec_com):
-        self.ser = Serial(mec_com,115200)
+    def __init__(self, ultra_com, mec_com):
+        '''
+        :param ultra_com: serial port for ultrasonic sensors
+        :param mec_com: serial port for mecanum platform
+        :return:
+        '''
+        self.ser = Serial(mec_com, 115200)
         self.sensor = Ultrasonic(ultra_com)
+        self.env_data = self.sensor.freshdata
         self.mec = MecanumBase()
+        self.__ev = Event()
+        self.run_count = 0
+        self.end_count = 0
+        self.Info = DrivingInfo()
+        self.res = None
         self.stop_cmd = self.mec.stop()
         self.cmd = deepcopy(self.stop_cmd)
-        self.dis = None
-        self.dir = np.zeros((4,3))
-        self.current_sts = ['stop',]
-
+        self.op = np.array([[1,1,1],[-1,-1,-1],[-1,-1,-1],[1,1,1]])
+        self.co = np.array([[.1,.1,.1],[-.1,-.1,-.1],[-.1,-.1,-.1],[.1,.1,.1]])
         threading.Thread.__init__(self)
         self.start()
 
     def run(self):
-        self.dis = self.sensor.freshdata
-        clk = pygame.time.Clock()
-        ind = 0
+        clk = pygame.time.tick_busy_loop()
         while True:
-            self.ser.write(self.cmd)
-            ind %= 20
-            if not ind:
-                tm = self.sensor.freshdata
-                self.dir = np.sign(tm - self.dis)        #方向向量
-                self.dis = tm
+            self.env_data = self.sensor.freshdata
 
-            if self.cmd == self.stop_cmd:   self.dir = np.zeros((4,3))
-            ind+=1
-            clk.tick(30)
+            if self.end_count == 0:     #stop
+                self.run_count = 0
+                self.ser.write(self.stop_cmd)
+            else:                       #running
+                self.res = self.check(self.Info,self.env_data,SAFEDIS)
+                if self.res.size != 0:
+                    self.end_count = 0
+                    self.__ev.set()
+                else:
+                    self.ser.write(self.cmd)
+                    if self.run_count > self.end_count:
+                        self.end_count = 0
+                        self.__ev.set()
+                    self.run_count += 1
 
-    def check(self,cmd,threshold):
+            clk.tick(FRAMERATE)
 
-        if cmd[0]=='move':
-            y = self.dir[[0,2],]
-            x = self.dir[[1,3],]
-            cm = np.sign(cmd[1])
-            xx,yy = cm
-            dx = xx*x
-            dy = yy*y
+    def check(self, drivinginfo, envdata,safedis):
+        envdata = envdata * self.op
+        if drivinginfo.mode == 'translate':
+            xstp = STP * drivinginfo.destination[0] * drivinginfo.vel / drivinginfo.distance
+            ystp = STP * drivinginfo.destination[1] * drivinginfo.vel / drivinginfo.distance
+            envdata[[1,3],] += (np.ones((2,3)) * xstp)
+            envdata[[0,2],] += (np.ones((2,3)) * ystp)
+            return np.where(abs(envdata) < safedis)[0]
+        elif drivinginfo.mode == 'rotate':
+            envdata += np.sign(drivinginfo.destination) * drivinginfo.vel * self.co * STP
+            return np.where(abs(envdata) < safedis)[0]
+        else:
+            return 0,
 
-
-
-
-
-
-    def __resolve(self,vec):
+    def __resolve(self, vec):
+        '''
+        :param vec: destination position
+        :return: actual length of the vec, angle for driving mecanum
+        '''
         vec = np.array(vec)
         mo = np.sqrt(np.sum(vec*vec))
-        if mo==0:return mo,0
+        if mo == 0: return mo, 0
         ang = np.arcsin(vec[1]/mo)*180/np.pi
-        if vec[0]>0:ang = ang-90
-        else:   ang = 90-ang
-        if ang>=0:   ang = ang
-        else:   ang = 360+ang
-        return mo,int(ang)
 
-    def move(self,pos,vel=30,timeout=100): #mm
-        '''
-        pos:[x,y] x: -right y:-forward /mm
-        '''
+        if vec[0] > 0:      ang -= 90
+        else:               ang = 90 - ang
+        if ang >= 0:        ang = ang
+        else:               ang += 360
+        return mo, int(ang)
 
-        self.current_sts = ['move',pos]
+    def move(self,pos,vel=TVEL):  #mm
+        vel = abs(vel)
         dis,ang = self.__resolve(pos)
+        self.Info.destination = pos
+        self.Info.mode = 'translate'
+        self.Info.distance = dis
+        self.Info.vel = vel
         self.cmd = self.mec.translateV(vel,ang)
-        p = 1000*dis/vel
-        pygame.time.delay(p)
-        self.current_sts = ['stop',]
-        self.cmd = self.stop_cmd
-        pygame.time.wait(timeout)
+        self.end_count = int(dis/(vel*STP))
+        self.__ev.wait()
+        self.__ev.clear()
+        return self.res.size,self.res
 
-    def rotate(self,ang,vel=2.5,timeout=100):
-        self.current_sts = ['rotate',ang]
-        self.cmd = self.mec.rotateV(np.sign(ang)*vel)
-        p = 1000*ang/vel
-        pygame.time.delay(p)
-        self.current_sts = ['stop',]
-        self.cmd = self.stop_cmd
-        pygame.time.wait(timeout)
-
-
-
+    def rotate(self,angle,vel=RVEL):  #mm
+        vel = abs(vel)
+        self.Info.destination = angle
+        self.Info.mode = 'rotate'
+        self.Info.distance = abs(angle)
+        self.Info.vel = vel
+        self.cmd = self.mec.rotateV(vel * np.sign(angle))
+        self.end_count = int(abs(angle)/(vel*STP))
+        self.__ev.wait()
+        self.__ev.clear()
+        return self.res.size,self.res

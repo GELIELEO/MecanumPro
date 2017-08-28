@@ -57,9 +57,9 @@ class MecanumBase():
 
     def rotateV(self,v): #度/s
         '''rotate with vel v, rudely
-        v positive->counterclockwise'''
+        v positive->clockwise'''
         
-        return self.__encode__A(v)
+        return self.__encode__A(-v)
 
     def _dir(self,v):
         if v>=0:	return 0
